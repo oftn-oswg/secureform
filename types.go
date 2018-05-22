@@ -6,10 +6,7 @@ import (
 )
 
 // File represents a form input element such as <input type="file" />
-type File struct {
-	multipart.File
-	*multipart.FileHeader
-}
+type File *multipart.FileHeader
 
 // Type represents an arbitrary interface for parsing
 type Type interface {

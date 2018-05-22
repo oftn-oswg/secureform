@@ -1,6 +1,7 @@
 package secureform
 
 import (
+	"mime/multipart"
 	"net/http"
 	"net/url"
 	"reflect"
@@ -16,8 +17,9 @@ import (
 
 // Parser defines the security parameters for form parsing.
 type Parser struct {
-	MaxMemory    int64
-	MaxStringLen int
+	maxMemory    int64
+	maxBytes     int64
+	maxStringLen int
 }
 
 type parserTag struct {
@@ -40,28 +42,36 @@ func (t *parserTag) Parse(tag string) error {
 	return nil
 }
 
-// Parse parses the form with the options of the parser and loads the results
-// into the fields struct.
-func (parser *Parser) Parse(fields interface{}, r *http.Request) error {
-	if err := r.ParseForm(); err != nil {
-		return err
+// NewParser allocates and returns a new Parser with the specified properties.
+//
+// The memory paramater is the maximum memory used before writing extra to the disk.
+// The bytes parameter is the maximum size request body before sending an error
+// back to the client. The stringLen parameter is the maximum size string allowed
+// in a string form field.
+func NewParser(memory, bytes int64, stringLen int) *Parser {
+	return &Parser{
+		maxMemory:    memory,
+		maxBytes:     bytes,
+		maxStringLen: stringLen,
 	}
-	if err := parser.loadForm(fields, r); err != nil {
-		return err
-	}
-	return nil
 }
 
-// ParseMultipart parses the multipart form with the options of the parser and
-// loads the results into the fields struct.
-func (parser *Parser) ParseMultipart(fields interface{}, r *http.Request) error {
-	if err := r.ParseMultipartForm(parser.MaxMemory); err != nil {
-		return err
+// Parse parses the form with the options of the parser and loads the results
+// into the fields struct.
+func (parser *Parser) Parse(w http.ResponseWriter, r *http.Request, fields interface{}) (err error) {
+	r.Body = http.MaxBytesReader(w, r.Body, parser.maxBytes)
+
+	err = r.ParseMultipartForm(parser.maxMemory)
+	if err != nil {
+		return
 	}
-	if err := parser.loadForm(fields, r); err != nil {
-		return err
+
+	err = parser.loadForm(fields, r)
+	if err != nil {
+		return
 	}
-	return nil
+
+	return
 }
 
 func (parser *Parser) loadForm(fields interface{}, r *http.Request) error {
@@ -94,7 +104,7 @@ func (parser *Parser) loadForm(fields interface{}, r *http.Request) error {
 			}
 		}
 
-		err := parser.loadFormValueList(field, &tag, r.Form[tag.Name])
+		err := parser.loadFormValueList(field, &tag, r)
 		if err != nil {
 			return &FieldError{Name: tag.Name, Err: err}
 		}
@@ -104,12 +114,18 @@ func (parser *Parser) loadForm(fields interface{}, r *http.Request) error {
 	return nil
 }
 
-func (parser *Parser) loadFormValueList(field reflect.Value, tag *parserTag, list []string) error {
+func (parser *Parser) loadFormValueList(field reflect.Value, tag *parserTag, r *http.Request) error {
+	size := 0
+	if isFileField(field) {
+		size = len(r.MultipartForm.File[tag.Name])
+	} else {
+		size = len(r.Form[tag.Name])
+	}
+
 	if field.Kind() == reflect.Slice {
-		size := len(list)
 		field.Set(reflect.MakeSlice(field.Type(), size, size))
 		for i := 0; i < size; i++ {
-			err := parser.loadFormValue(field.Index(i), tag, list[i])
+			err := parser.loadFormValue(field.Index(i), tag, r, i)
 			if err != nil {
 				return nil
 			}
@@ -117,19 +133,20 @@ func (parser *Parser) loadFormValueList(field reflect.Value, tag *parserTag, lis
 		return nil
 	}
 
-	if len(list) == 0 {
+	if size == 0 {
 		field.Set(reflect.Zero(field.Type()))
 		return nil
 	}
 
-	return parser.loadFormValue(field, tag, list[0])
+	return parser.loadFormValue(field, tag, r, 0)
 }
 
-func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, value string) error {
+func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, r *http.Request, index int) error {
 	switch field.Kind() {
 	case reflect.Bool:
 		field.SetBool(true)
 	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		value := formValueByIndex(r.Form, tag.Name, index)
 		i, err := strconv.ParseInt(value, 10, field.Type().Bits())
 		if err != nil {
 			return err
@@ -142,6 +159,7 @@ func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, value s
 		field.SetInt(i)
 
 	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		value := formValueByIndex(r.Form, tag.Name, index)
 		u, err := strconv.ParseUint(value, 10, field.Type().Bits())
 		if err != nil {
 			return err
@@ -154,6 +172,7 @@ func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, value s
 		field.SetUint(u)
 
 	case reflect.Float32, reflect.Float64:
+		value := formValueByIndex(r.Form, tag.Name, index)
 		f, err := strconv.ParseFloat(value, field.Type().Bits())
 		if err != nil {
 			return err
@@ -167,7 +186,8 @@ func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, value s
 
 	case reflect.String:
 		// Validate string
-		if err := validateString(value, tag, parser.MaxStringLen); err != nil {
+		value := formValueByIndex(r.Form, tag.Name, index)
+		if err := validateString(value, tag, parser.maxStringLen); err != nil {
 			return err
 		}
 
@@ -177,6 +197,7 @@ func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, value s
 
 		// Generic value validator interface.
 		if fieldType, ok := field.Addr().Interface().(Type); ok {
+			value := formValueByIndex(r.Form, tag.Name, index)
 			err := fieldType.Set(value)
 			if err != nil {
 				return err
@@ -184,8 +205,44 @@ func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, value s
 			return nil
 		}
 
+		// secureform.File struct
+		if file, ok := field.Addr().Interface().(*File); ok {
+			header := formFileByIndex(r.MultipartForm, tag.Name, index)
+			if header == nil {
+				return http.ErrMissingFile
+			}
+			*file = header
+			return nil
+		}
+
 		return ErrInvalidKind
 	}
 
+	return nil
+}
+
+func isFileField(field reflect.Value) bool {
+	if _, ok := field.Addr().Interface().(*File); ok {
+		return true
+	}
+	if _, ok := field.Addr().Interface().(*[]File); ok {
+		return true
+	}
+	return false
+}
+
+func formValueByIndex(form url.Values, name string, index int) string {
+	field := form[name]
+	if index < len(field) {
+		return field[index]
+	}
+	return ""
+}
+
+func formFileByIndex(form *multipart.Form, name string, index int) *multipart.FileHeader {
+	field := form.File[name]
+	if index < len(field) {
+		return field[index]
+	}
 	return nil
 }

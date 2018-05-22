@@ -137,7 +137,7 @@ func TestParseForm(t *testing.T) {
 
 	for _, test := range tests {
 		r := NewMockRequest(test.Query)
-		parser := Parser{MaxStringLen: 24}
+		parser := Parser{maxStringLen: 24}
 		query, err := url.ParseQuery(test.Query)
 		if err != nil {
 			panic(err)
