@@ -1,6 +1,7 @@
 package secureform
 
 import (
+	"mime"
 	"mime/multipart"
 	"net/http"
 	"net/url"
@@ -19,7 +20,7 @@ import (
 type Parser struct {
 	maxMemory    int64
 	maxBytes     int64
-	maxStringLen int
+	maxStringLen int64
 }
 
 type parserTag struct {
@@ -44,11 +45,11 @@ func (t *parserTag) Parse(tag string) error {
 
 // NewParser allocates and returns a new Parser with the specified properties.
 //
-// The memory paramater is the maximum memory used before writing extra to the disk.
-// The bytes parameter is the maximum size request body before sending an error
-// back to the client. The stringLen parameter is the maximum size string allowed
-// in a string form field.
-func NewParser(memory, bytes int64, stringLen int) *Parser {
+// The memory paramater is the maximum memory used before writing extra to the disk
+// with multipart form data. The bytes parameter is the maximum size request body
+// before sending an error back to the client. The stringLen parameter is the maximum
+// size string allowed in a string form field.
+func NewParser(memory, bytes, stringLen int64) *Parser {
 	return &Parser{
 		maxMemory:    memory,
 		maxBytes:     bytes,
@@ -59,9 +60,31 @@ func NewParser(memory, bytes int64, stringLen int) *Parser {
 // Parse parses the form with the options of the parser and loads the results
 // into the fields struct.
 func (parser *Parser) Parse(w http.ResponseWriter, r *http.Request, fields interface{}) (err error) {
-	r.Body = http.MaxBytesReader(w, r.Body, parser.maxBytes)
+	if parser.maxBytes > 0 {
+		r.Body = http.MaxBytesReader(w, r.Body, parser.maxBytes)
+	}
+	if parser.maxMemory <= 0 {
+		parser.maxMemory = 32 << 20 // 32 MB
+	}
+	if parser.maxStringLen <= 0 {
+		parser.maxStringLen = parser.maxMemory
+	}
 
-	err = r.ParseMultipartForm(parser.maxMemory)
+	multipart := false
+
+	contentType := r.Header.Get("Content-Type")
+	if contentType != "" {
+		contentType, _, err := mime.ParseMediaType(contentType)
+		if err == nil && contentType == "multipart/form-data" {
+			multipart = true
+		}
+	}
+
+	if multipart {
+		err = r.ParseMultipartForm(parser.maxMemory)
+	} else {
+		err = r.ParseForm()
+	}
 	if err != nil {
 		return
 	}
@@ -142,6 +165,26 @@ func (parser *Parser) loadFormValueList(field reflect.Value, tag *parserTag, r *
 }
 
 func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, r *http.Request, index int) error {
+	// Generic value validator interface.
+	if fieldType, ok := field.Addr().Interface().(Type); ok {
+		value := formValueByIndex(r.Form, tag.Name, index)
+		err := fieldType.Set(value)
+		if err != nil {
+			return err
+		}
+		return nil
+	}
+
+	// secureform.File struct
+	if file, ok := field.Addr().Interface().(*File); ok {
+		header := formFileByIndex(r.MultipartForm, tag.Name, index)
+		if header == nil {
+			return http.ErrMissingFile
+		}
+		file.FileHeader = header
+		return nil
+	}
+
 	switch field.Kind() {
 	case reflect.Bool:
 		field.SetBool(true)
@@ -194,26 +237,6 @@ func (parser *Parser) loadFormValue(field reflect.Value, tag *parserTag, r *http
 		field.SetString(value)
 
 	default:
-
-		// Generic value validator interface.
-		if fieldType, ok := field.Addr().Interface().(Type); ok {
-			value := formValueByIndex(r.Form, tag.Name, index)
-			err := fieldType.Set(value)
-			if err != nil {
-				return err
-			}
-			return nil
-		}
-
-		// secureform.File struct
-		if file, ok := field.Addr().Interface().(*File); ok {
-			header := formFileByIndex(r.MultipartForm, tag.Name, index)
-			if header == nil {
-				return http.ErrMissingFile
-			}
-			*file = header
-			return nil
-		}
 
 		return ErrInvalidKind
 	}

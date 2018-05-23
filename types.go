@@ -6,7 +6,9 @@ import (
 )
 
 // File represents a form input element such as <input type="file" />
-type File *multipart.FileHeader
+type File struct {
+	*multipart.FileHeader
+}
 
 // Type represents an arbitrary interface for parsing
 type Type interface {
@@ -79,7 +81,7 @@ func validateFloat(value float64, tag *parserTag) error {
 	return nil
 }
 
-func validateString(value string, tag *parserTag, rootmax int) error {
+func validateString(value string, tag *parserTag, rootmax int64) error {
 	if tag.Min != "" {
 		min, err := strconv.ParseInt(tag.Min, 0, 64)
 		if err != nil {
@@ -98,7 +100,7 @@ func validateString(value string, tag *parserTag, rootmax int) error {
 			return ErrValidMax
 		}
 	}
-	if len(value) > rootmax {
+	if int64(len(value)) > rootmax {
 		return ErrValidMax
 	}
 	return nil
